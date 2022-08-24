@@ -1,4 +1,4 @@
-# Inicio de Sesión con Python, Flask y Docker
+# Inicio de Sesión con Python, Flask y Google Cloud
 
 En este documento se explican uno a uno todos los archivos utilizados en el proyecto, la explicación se realiza línea por línea.  
 <br><br>
@@ -51,29 +51,45 @@ def index():
     user_ip = request.remote_addr
 ```
 
-Me redirige a la ruta ```hello``
+Me redirige a la ruta ```hello```
 ```python    
     response = make_response(redirect('/hello'))
     session['user_ip'] = user_ip
     return response
 ```
 
-```session``` se utiliza para guardar a través de varias peticiones información del usuario de manera segura (encriptada)
+
 ```python
-@app.route('/hello', methods=['GET'])
+@app.route('/hello', methods=['GET', 'POST'])
 @login_required
 def hello():
     user_ip = session.get('user_ip')
-    username = session.get('username')
+    username = current_user.id
+```
+
+Se crea una instancia de la clase ```TodoForm```
+```python
+    todo_form = TodoForm()
 ```
 
 El contexto de la aplicación es un buen lugar para almacenar datos comunes durante una solicitud
 ```python
     context = {
-        'user_ip': user_ip, 
-        'todos': todos,
-        'username': username
+        'user_ip': user_ip,
+        'todos': get_todos(user_id=username),
+        'username': username,
+        'todo_form': todo_form
     }
+```
+
+Agrega una Tarea en la Base de Datos, llamando a la función ```put_todo```
+```python 
+    if todo_form.validate_on_submit():
+        put_todo(user_id=username, description=todo_form.description.data)
+
+        flash('Tu tarea se creo con éxito!')
+
+        return redirect(url_for('hello'))
 ```
 
 Renderiza la plantilla ```hello.html```    
@@ -174,9 +190,14 @@ class LoginForm(FlaskForm):
     password = PasswordField('Password', validators=[DataRequired()])
     submit = SubmitField('Enviar')
 ```    
+
+Formulario para ingresar una nueva tarea
+```python
+class TodoForm(FlaskForm):
+    description = StringField('Descripción', validators=[DataRequired()])
+    submit = SubmitField('Crear')
+```   
 <br><br><br><br>
-
-
 
 
 
@@ -188,8 +209,8 @@ class LoginForm(FlaskForm):
 Creamos un ```blueprint```, el cual va a tener el nombre ```auth```. Todas las rutas que comiencen con ```/auth``` van a ser rutedas o dirigidas a este ```blueprint```
 ```python
 from flask import Blueprint
-
 auth = Blueprint('auth', __name__, url_prefix='/auth')
+from . import views
 ``` 
 <br><br><br><br>
 
@@ -206,14 +227,22 @@ auth = Blueprint('auth', __name__, url_prefix='/auth')
 Importamos las librerías que se utilizan en este mismo archivo
 ```python
 from flask import render_template, session, redirect, flash, url_for
-from . import auth
+from flask_login import login_user, login_required, logout_user
+from werkzeug.security import generate_password_hash
+
 from app.forms import LoginForm
+
+from . import auth
+from app.firestore_service import get_user, user_put
+from app.models import UserModel, UserData
 ``` 
 
 En esta ruta, voy a utilizar 2 métodos, uno para publicar las credenciales de usuario en la Base de Datos y otro para extraer las credenciales de la Base de Datos.
 ```python
 @auth.route('/login', methods=['GET', 'POST'])
 ```
+
+## Función para que el usuario acceda a la aplicación
 
 Creo una instancia de la clase LoginForm() 
 ```python
@@ -227,15 +256,99 @@ def login():
     }
 ```  
 
-El método ```validate_on_submit()``` del formulario devuelve ```True``` cuando se envió el formulario y todos los validadores de campo aceptaron los datos. En todos los demás casos, ```validate_on_submit()``` devuelve False.    
+El método ```validate_on_submit()``` del formulario devuelve ```True``` cuando se envió el formulario y todos los validadores de campo aceptaron los datos. En todos los demás casos, ```validate_on_submit()``` devuelve ```False```.    
 ```python
     if login_form.validate_on_submit():
         username = login_form.username.data
-        session['username'] = username
-        flash('Nombre de usuario registrado con éxito')
-        return redirect(url_for('index'))
+        password = login_form.password.data
+``` 
 
-    return render_template('login.html', **context)
+Lee el ID de usuario desde la Base de Datos en Google Cloud
+```python
+        user_doc = get_user(username)
+``` 
+
+Si el ID de usuario no está vacío, lea la contraseña desde la Base de Datos en Google Cloud
+```python
+        if user_doc.to_dict() is not None:
+            password_from_db = user_doc.to_dict()['password']
+``` 
+
+Si la contraseña de la Base de Datos es igual a la que el usuario ingresó, se le da ingreso al usuario y se desplega un mensaje de bienvenida
+```python
+            if password == password_from_db:
+                user_data = UserData(username, password)
+                user = UserModel(user_data)
+
+                login_user(user)
+
+                flash('Bienvenido de nuevo')
+
+                redirect(url_for('hello'))
+``` 
+
+Si las contraeñas no concuerdan, no se da acceso y se muestra otro mensaje
+```python
+            else:
+                flash('La información no coincide')
+        else:
+            flash('El usario no existe')
+
+        return redirect(url_for('index'))
+``` 
+
+## Función para que el usuario se registre por primera vez
+```python
+@auth.route('signup', methods=['GET', 'POST'])
+def signup():
+    signup_form = LoginForm()
+    context = {
+        'signup_form': signup_form
+    }
+``` 
+
+Si lo que se escribió en los campos es válido, se guarda ese usuario y contraseña ingresados.
+```python
+    if signup_form.validate_on_submit():
+        username = signup_form.username.data
+        password = signup_form.password.data
+
+        user_doc = get_user(username)
+``` 
+
+Se genera una contraseña encriptada y la almacenamos en la base de datos junto con el nombre de usuario
+```python
+        if user_doc.to_dict() is None:
+            password_hash = generate_password_hash(password)
+            user_data = UserData(username, password_hash)
+            user_put(user_data)
+
+            user = UserModel(user_data)
+
+            login_user(user)
+
+            flash('Bienvenido!')
+
+            return redirect(url_for('hello'))
+``` 
+
+Si el usuario ya está registrado en la base de datos, no se realiza el registro y se muestra un mensaje
+```python
+        else:
+            flash('El usario existe!')
+
+    return render_template('signup.html', **context)
+``` 
+
+Esta función nos redirige a la página de ingreso de credenciales
+```python
+@auth.route('logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Regresa pronto')
+
+    return redirect(url_for('auth.login'))
 ``` 
 <br><br><br><br>
 
@@ -281,6 +394,7 @@ Cada vez que flask-login quiera cargar el usuario vamos a llamar esta ```query``
         )
         return UserModel(user_data)
 ```
+<br><br><br><br>
 
 
 
